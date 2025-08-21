@@ -3,17 +3,18 @@ const express = require("express");
 const cors = require("cors");
 const bodyParser = require("body-parser");
 const { Configuration, OpenAIApi } = require("openai");
-require("dotenv").config(); // Loads .env file
 
 const app = express();
 app.use(cors());
 app.use(bodyParser.json());
 
+// ✅ OpenAI configuration - Render will inject your key automatically
 const configuration = new Configuration({
-  apiKey: process.env.OPENAI_API_KEY, // Taken from .env
+  apiKey: process.env.OPENAI_API_KEY,
 });
 const openai = new OpenAIApi(configuration);
 
+// Chat endpoint
 app.post("/chat", async (req, res) => {
   const { message } = req.body;
 
@@ -26,10 +27,13 @@ app.post("/chat", async (req, res) => {
     const reply = completion.data.choices[0].message.content;
     res.json({ reply });
   } catch (error) {
-    console.error(error);
+    console.error("Error from OpenAI:", error.response?.data || error.message);
     res.status(500).json({ reply: "Error connecting to AI." });
   }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+// Start server
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
