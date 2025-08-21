@@ -1,34 +1,35 @@
-import express from "express";
-import cors from "cors";
-import bodyParser from "body-parser";
+// server.js
+const express = require("express");
+const cors = require("cors");
+const bodyParser = require("body-parser");
+const { Configuration, OpenAIApi } = require("openai");
+require("dotenv").config(); // Loads .env file
 
-// Create Express app
 const app = express();
-
-// Middleware
 app.use(cors());
 app.use(bodyParser.json());
 
-// Example health check route
-app.get("/", (req, res) => {
-  res.send("Chatbot backend is running!");
+const configuration = new Configuration({
+  apiKey: process.env.OPENAI_API_KEY, // Taken from .env
 });
+const openai = new OpenAIApi(configuration);
 
-// Example chatbot endpoint
-app.post("/chat", (req, res) => {
+app.post("/chat", async (req, res) => {
   const { message } = req.body;
-  if (!message) {
-    return res.status(400).json({ error: "No message provided" });
+
+  try {
+    const completion = await openai.createChatCompletion({
+      model: "gpt-3.5-turbo",
+      messages: [{ role: "user", content: message }],
+    });
+
+    const reply = completion.data.choices[0].message.content;
+    res.json({ reply });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ reply: "Error connecting to AI." });
   }
-
-  // Example reply
-  const reply = `You said: ${message}`;
-  res.json({ reply });
 });
 
-// Listen on Render's port or 3000 locally
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
-
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
