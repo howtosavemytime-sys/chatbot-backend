@@ -5,15 +5,15 @@ import bodyParser from "body-parser";
 import OpenAI from "openai";
 
 const app = express();
-app.use(cors());
-app.use(bodyParser.json());
+app.use(cors());           // Allow requests from any website
+app.use(bodyParser.json()); // Parse JSON request bodies
 
-// ✅ OpenAI client - Render will inject your API key automatically
+// ✅ OpenAI client - make sure OPENAI_API_KEY is set in Render Environment Variables
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-// Chat endpoint
+// POST /chat endpoint
 app.post("/chat", async (req, res) => {
   const { message } = req.body;
 
