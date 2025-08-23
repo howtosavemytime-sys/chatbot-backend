@@ -4,6 +4,7 @@ import cors from "cors";
 import bodyParser from "body-parser";
 import OpenAI from "openai";
 import { v4 as uuidv4 } from "uuid";
+import fetch from "node-fetch";
 
 const app = express();
 app.use(cors());
@@ -13,6 +14,11 @@ app.use(bodyParser.json());
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
+
+// Calendly config
+const CALENDLY_TOKEN = process.env.CALENDLY_TOKEN; // Add token in Render secrets
+const EVENT_URL = "https://calendly.com/madetoautomate/15-minut-meeting";
+const TIMEZONE = "CET";
 
 // In-memory session store
 const sessions = {};
@@ -29,7 +35,6 @@ function getSession(sessionId) {
     return { sessionId: newId, session: sessions[newId] };
   }
 
-  // Reset session if inactive
   if (now - sessions[sessionId].lastActive > SESSION_TIMEOUT_MS) {
     sessions[sessionId] = { count: 0, lastActive: now };
   }
@@ -38,40 +43,65 @@ function getSession(sessionId) {
   return { sessionId, session: sessions[sessionId] };
 }
 
+// Helper: get next 3 available slots from Calendly
+async function getCalendlySlots() {
+  const res = await fetch("https://api.calendly.com/scheduled_events", {
+    headers: {
+      Authorization: `Bearer ${CALENDLY_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+  });
+  const data = await res.json();
+  // This is a simplified version: pick next 3 upcoming times
+  const now = new Date();
+  const slots = data.collection
+    .filter(e => new Date(e.start_time) > now)
+    .slice(0, 3)
+    .map(e => ({
+      start: e.start_time,
+      end: e.end_time,
+    }));
+  return slots;
+}
+
 // POST /chat endpoint
 app.post("/chat", async (req, res) => {
-  const { message, sessionId, userName } = req.body;
-
+  const { message, sessionId, userName, userEmail, marketingConsent } = req.body;
   const { sessionId: activeSessionId, session } = getSession(sessionId);
 
-  // Check message limit
-  if (session.count >= MESSAGE_LIMIT) {
-    return res.json({
-      reply:
-        "It looks like we’ve covered a lot! For more help, please schedule a free discovery call.",
-      sessionId: activeSessionId,
-    });
-  }
-
+  // Increment message count
   session.count++;
 
-  // System message with FAQ and instructions
+  // After 3 messages, suggest booking
+  let suggestBooking = false;
+  if (session.count === 3) suggestBooking = true;
+
   const systemMessage = `
-You are a friendly chatbot for MadeToAutomate. Only answer questions about MadeToAutomate services, workflows, and processes.
-Always use a friendly, simple, and easy-to-understand tone suitable for users with little or no technical knowledge.
-If a user asks something outside your knowledge, politely respond:
+You are a friendly chatbot for MadeToAutomate. Only answer questions about MadeToAutomate services.
+Always use friendly, simple language.
+If user asks something unrelated, respond:
 "Sorry, I can only answer questions about MadeToAutomate services. Can I help you with something we do?"
-
-FAQ:
-- Who do you help? Businesses and individuals with workflow automation.
-- What can you automate? Email, reporting, CRM, e-commerce, scheduling, customer support bots.
-- How it works? Free Discovery Call → Automation Plan → Build & Launch → Ongoing Support.
-- Other questions? Politely guide users to the relevant service or Discovery Call.
-
 Greet the user by name if provided.
 `;
 
   try {
+    let replyText = "";
+
+    if (suggestBooking) {
+      // Get 3 available slots
+      const slots = await getCalendlySlots();
+      if (slots.length > 0) {
+        replyText = "I see you’re interested! Here are 3 available times to book a free discovery call:";
+        res.json({ 
+          reply: replyText, 
+          sessionId: activeSessionId, 
+          bookingSlots: slots 
+        });
+        return;
+      }
+    }
+
+    // Regular OpenAI reply
     const completion = await openai.chat.completions.create({
       model: "gpt-3.5-turbo",
       messages: [
@@ -80,20 +110,47 @@ Greet the user by name if provided.
       ],
     });
 
-    // Always send a reply, even if off-topic
-    const reply = completion.choices[0].message.content || 
+    replyText = completion.choices[0].message.content || 
       "Sorry, I can only answer questions about MadeToAutomate services. Can I help you with something we do?";
 
-    res.json({ reply, sessionId: activeSessionId });
+    res.json({ reply: replyText, sessionId: activeSessionId });
   } catch (error) {
-    console.error("OpenAI error details:", error);
+    console.error("Error in chat:", error);
+    res.json({ reply: "Sorry, a little trouble now. Can we continue talking about MadeToAutomate services?", sessionId: activeSessionId });
+  }
+});
 
-    // Instead of showing "Error connecting to AI", always return a friendly fallback
-    res.json({
-      reply:
-        "Sorry, I’m having a little trouble right now. Can we continue talking about MadeToAutomate services?",
-      sessionId: activeSessionId,
+// POST /book endpoint to create booking
+app.post("/book", async (req, res) => {
+  const { startTime, userName, userEmail } = req.body;
+
+  try {
+    const body = {
+      max_event_count: 1,
+      invitee: {
+        email: userEmail,
+        name: userName
+      },
+      event: EVENT_URL,
+      start_time: startTime,
+      timezone: TIMEZONE
+    };
+
+    const response = await fetch("https://api.calendly.com/scheduled_events", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${CALENDLY_TOKEN}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(body)
     });
+
+    if (!response.ok) throw new Error("Failed to book on Calendly");
+
+    res.json({ success: true, message: "Your discovery call has been booked!" });
+  } catch (err) {
+    console.error("Booking error:", err);
+    res.status(500).json({ success: false, message: "Failed to book appointment. Try again later." });
   }
 });
 
