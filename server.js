@@ -5,7 +5,6 @@ import bodyParser from "body-parser";
 import OpenAI from "openai";
 import { v4 as uuidv4 } from "uuid";
 import nodemailer from "nodemailer";
-import fetch from "node-fetch";
 import { DateTime } from "luxon";
 
 const app = express();
@@ -25,8 +24,6 @@ const transporter = nodemailer.createTransport({
 });
 
 const ADMIN_EMAIL = process.env.TO_EMAIL;
-const CALENDLY_TOKEN = process.env.CALENDLY_TOKEN;
-const CALENDLY_EVENT_URL = process.env.CALENDLY_EVENT_URL;
 
 const sessions = {};
 const SESSION_TIMEOUT_MS = 60 * 60 * 1000;
@@ -35,26 +32,29 @@ function getSession(sessionId) {
   const now = Date.now();
   if (!sessionId || !sessions[sessionId]) {
     const newId = uuidv4();
-    sessions[newId] = { messages: [], userName: null, userEmail: null, marketingConsent: null, lastActive: now, messageCount: 0 };
+    sessions[newId] = { messages: [], userName: null, userEmail: null, marketingConsent: null, lastActive: now, messageCount: 0, askedBooking: false };
     return { sessionId: newId, session: sessions[newId] };
   }
   if (now - sessions[sessionId].lastActive > SESSION_TIMEOUT_MS) {
-    sessions[sessionId] = { messages: [], userName: null, userEmail: null, marketingConsent: null, lastActive: now, messageCount: 0 };
+    sessions[sessionId] = { messages: [], userName: null, userEmail: null, marketingConsent: null, lastActive: now, messageCount: 0, askedBooking: false };
   }
   sessions[sessionId].lastActive = now;
   return { sessionId, session: sessions[sessionId] };
 }
 
-// Fetch available slots from Calendly
-async function getCalendlyAvailability() {
-  const headers = { Authorization: `Bearer ${CALENDLY_TOKEN}` };
-  const eventUri = CALENDLY_EVENT_URL.split('calendly.com/')[1];
-  const res = await fetch(`https://api.calendly.com/scheduled_events?event_type=${eventUri}&status=active`, { headers });
-  const data = await res.json();
-
-  // Placeholder logic: just return next 3 hours for demo if Calendly API structure differs
-  const now = DateTime.now().setZone("Europe/Paris");
-  return [1,2,3].map(h => now.plus({ hours: h }).toFormat("yyyy-MM-dd HH:mm"));
+function generateBookingSlots() {
+  const slots = [];
+  let dt = DateTime.now().setZone("Europe/Paris").plus({ days: 1 }).startOf("day");
+  while (slots.length < 3) {
+    if (dt.weekday <= 5) { // Mon-Fri
+      const hour = 10 + Math.floor(Math.random() * 7); // 10..16
+      const minute = Math.random() < 0.5 ? 0 : 30;
+      const slot = dt.set({ hour, minute });
+      slots.push(slot.toFormat("yyyy-MM-dd HH:mm"));
+    }
+    dt = dt.plus({ days: 1 });
+  }
+  return slots;
 }
 
 // --- Chat endpoint ---
@@ -81,16 +81,17 @@ Greet user by name if available.
       messages: [{ role: "system", content: systemMessage }, ...session.messages],
     });
 
-    const replyText = completion.choices[0].message.content ||
-      "Sorry, I can only answer questions about MadeToAutomate services. Can I help you with something we do?";
-    session.messages.push({ role: "assistant", content: replyText });
+    let replyText = completion.choices[0].message.content || "Sorry, I can only answer questions about MadeToAutomate services.";
 
-    // Offer booking after 3 user messages
     let bookingSlots = null;
-    if (session.messageCount >= 3 && session.userName && session.userEmail) {
-      const slots = await getCalendlyAvailability();
-      bookingSlots = slots.map(s => ({ start: s }));
+    // Offer booking after 3 messages if user has name/email and hasn't been asked yet
+    if (session.messageCount >= 3 && session.userName && session.userEmail && !session.askedBooking) {
+      session.askedBooking = true;
+      replyText += "\n\nWould you like to book a 30-minute appointment with our representative?";
+      bookingSlots = generateBookingSlots().map(s => ({ start: s }));
     }
+
+    session.messages.push({ role: "assistant", content: replyText });
 
     res.json({ reply: replyText, sessionId: activeSessionId, bookingSlots });
   } catch (error) {
