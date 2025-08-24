@@ -25,7 +25,7 @@ const transporter = nodemailer.createTransport({
 
 const ADMIN_EMAIL = process.env.TO_EMAIL;
 const CALENDLY_TOKEN = process.env.CALENDLY_TOKEN;
-const CALENDLY_EVENT_TYPE = "https://calendly.com/madetoautomate/15-minut-meeting"; // your event type URL
+const CALENDLY_EVENT_TYPE = "https://calendly.com/madetoautomate/15-minut-meeting";
 
 const sessions = {};
 const SESSION_TIMEOUT_MS = 60 * 60 * 1000;
@@ -100,7 +100,7 @@ Greet user by name if available.
       messages: [{ role: "system", content: systemMessage }, ...session.messages],
     });
 
-    const replyText = completion.choices[0].message.content || 
+    let replyText = completion.choices[0].message.content || 
       "Sorry, I can only answer questions about MadeToAutomate services. Can I help you with something we do?";
     session.messages.push({ role: "assistant", content: replyText });
 
@@ -111,6 +111,9 @@ Greet user by name if available.
       if (slots.length) {
         session.offeredBooking = true;
         bookingSlots = slots;
+
+        // Prepend explicit booking question
+        replyText = `Would you like to book an appointment with our representative? Here are the available times:\n`;
       }
     }
 
