@@ -1,62 +1,123 @@
+// server.js
 import express from "express";
-import bodyParser from "body-parser";
 import cors from "cors";
+import bodyParser from "body-parser";
+import OpenAI from "openai";
+import { v4 as uuidv4 } from "uuid";
 import nodemailer from "nodemailer";
 
 const app = express();
-const PORT = process.env.PORT || 10000;
-
 app.use(cors());
 app.use(bodyParser.json());
 
-// Nodemailer transporter with SSL (port 465)
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
 const transporter = nodemailer.createTransport({
-  host: "smtp.zenbox.pl",
-  port: 465,
-  secure: true, // SSL
+  host: process.env.MAIL_HOST,
+  port: process.env.MAIL_PORT,
+  secure: process.env.MAIL_PORT == 465, // use SSL if port 465
   auth: {
-    user: "contact@madetoautomate.com",
-    pass: "XmJ@Z%w@F9Ux",
+    user: process.env.MAIL_USER,
+    pass: process.env.MAIL_PASS,
   },
 });
 
-// Test email route
-app.get("/test-email", async (req, res) => {
+const ADMIN_EMAIL = process.env.TO_EMAIL;
+
+const sessions = {};
+const SESSION_TIMEOUT_MS = 60 * 60 * 1000;
+
+function getSession(sessionId) {
+  const now = Date.now();
+  if (!sessionId || !sessions[sessionId]) {
+    const newId = uuidv4();
+    sessions[newId] = { messages: [], userName: null, userEmail: null, marketingConsent: null, lastActive: now, messageCount: 0 };
+    return { sessionId: newId, session: sessions[newId] };
+  }
+  if (now - sessions[sessionId].lastActive > SESSION_TIMEOUT_MS) {
+    sessions[sessionId] = { messages: [], userName: null, userEmail: null, marketingConsent: null, lastActive: now, messageCount: 0 };
+  }
+  sessions[sessionId].lastActive = now;
+  return { sessionId, session: sessions[sessionId] };
+}
+
+// --- Chat endpoint ---
+app.post("/chat", async (req, res) => {
+  const { message, sessionId, userName, userEmail, marketingConsent } = req.body;
+  const { sessionId: activeSessionId, session } = getSession(sessionId);
+
+  if (userName) session.userName = userName;
+  if (userEmail) session.userEmail = userEmail;
+  if (marketingConsent !== undefined) session.marketingConsent = marketingConsent;
+
+  session.messages.push({ role: "user", content: message });
+  session.messageCount++;
+
+  const systemMessage = `
+You are a friendly chatbot for MadeToAutomate.
+Answer only about MadeToAutomate services, workflows, and processes.
+Greet user by name if available.
+`;
+
   try {
-    let info = await transporter.sendMail({
-      from: '"Chatbot Test" <contact@madetoautomate.com>',
-      to: "contact@madetoautomate.com",
-      subject: "✅ Test Email from Chatbot Backend (SSL)",
-      text: "If you see this, SMTP over SSL works correctly!",
+    const completion = await openai.chat.completions.create({
+      model: "gpt-3.5-turbo",
+      messages: [{ role: "system", content: systemMessage }, ...session.messages],
     });
 
-    console.log("Email sent: ", info.messageId);
-    res.send("✅ Test email sent");
-  } catch (err) {
-    console.error("Email error:", err);
-    res.send("❌ Failed to send email: " + err.message);
+    const replyText = completion.choices[0].message.content || 
+      "Sorry, I can only answer questions about MadeToAutomate services. Can I help you with something we do?";
+    session.messages.push({ role: "assistant", content: replyText });
+
+    // Offer booking after 3 user messages
+    let bookingSlots = null;
+    if (session.messageCount >= 3 && session.userName && session.userEmail) {
+      const now = new Date();
+      bookingSlots = [
+        { start: new Date(now.getTime() + 1*60*60*1000) },
+        { start: new Date(now.getTime() + 2*60*60*1000) },
+        { start: new Date(now.getTime() + 3*60*60*1000) },
+      ];
+    }
+
+    res.json({ reply: replyText, sessionId: activeSessionId, bookingSlots });
+  } catch (error) {
+    console.error("Chat error:", error);
+    res.json({ reply: "Sorry, a little trouble now. Can we continue talking about MadeToAutomate services?", sessionId: activeSessionId });
   }
 });
 
-// Booking route
-app.post("/send-booking", async (req, res) => {
-  const { name, email, bookingDate, marketingConsent } = req.body;
+// --- Booking endpoint ---
+app.post("/book", async (req, res) => {
+  const { startTime, userName, userEmail, marketingConsent } = req.body;
+
+  if (!userName || !userEmail || !startTime) {
+    return res.status(400).json({ success: false, message: "Missing booking info" });
+  }
+
+  const emailText = `
+New Discovery Call Booking Request:
+
+Name: ${userName}
+Email: ${userEmail}
+Marketing Consent: ${marketingConsent === true ? "Agreed" : "Declined"}
+Requested Time: ${startTime}
+`;
 
   try {
     await transporter.sendMail({
-      from: '"Chatbot" <contact@madetoautomate.com>',
-      to: "contact@madetoautomate.com",
-      subject: "📅 New Booking Request",
-      text: `New booking request:\n\nName: ${name}\nEmail: ${email}\nDate: ${bookingDate}\nMarketing consent: ${marketingConsent}`,
+      from: `"MadeToAutomate Bot" <${process.env.MAIL_USER}>`,
+      to: ADMIN_EMAIL,
+      subject: "New Discovery Call Booking",
+      text: emailText,
     });
 
-    res.json({ success: true, message: "Booking email sent" });
+    res.json({ success: true, message: `Thanks ${userName}! Someone from our team will contact you shortly to confirm the appointment.` });
   } catch (err) {
     console.error("Booking email error:", err);
-    res.status(500).json({ success: false, message: err.message });
+    res.status(500).json({ success: false, message: "Failed to send booking info. Try again later." });
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-});
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
