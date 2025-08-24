@@ -4,7 +4,7 @@ import cors from "cors";
 import bodyParser from "body-parser";
 import OpenAI from "openai";
 import { v4 as uuidv4 } from "uuid";
-import fetch from "node-fetch";
+import nodemailer from "nodemailer";
 
 const app = express();
 app.use(cors());
@@ -15,142 +15,140 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-// Calendly config
-const CALENDLY_TOKEN = process.env.CALENDLY_TOKEN; // Add token in Render secrets
-const EVENT_URL = "https://calendly.com/madetoautomate/15-minut-meeting";
-const TIMEZONE = "CET";
+// ✅ Email config
+const transporter = nodemailer.createTransport({
+  host: "smtp.gmail.com", // or your provider
+  port: 465,
+  secure: true,
+  auth: {
+    user: process.env.EMAIL_USER, // add to Render secrets
+    pass: process.env.EMAIL_PASS, // add to Render secrets
+  },
+});
 
 // In-memory session store
 const sessions = {};
 const MESSAGE_LIMIT = 10;
 const SESSION_TIMEOUT_MS = 60 * 60 * 1000; // 1 hour
 
-// Helper to get or create session
+// Helper: get or create session
 function getSession(sessionId) {
   const now = Date.now();
 
   if (!sessionId || !sessions[sessionId]) {
     const newId = uuidv4();
-    sessions[newId] = { count: 0, lastActive: now };
+    sessions[newId] = {
+      count: 0,
+      lastActive: now,
+      history: [],
+      userName: null,
+      userEmail: null,
+    };
     return { sessionId: newId, session: sessions[newId] };
   }
 
   if (now - sessions[sessionId].lastActive > SESSION_TIMEOUT_MS) {
-    sessions[sessionId] = { count: 0, lastActive: now };
+    sessions[sessionId] = {
+      count: 0,
+      lastActive: now,
+      history: [],
+      userName: null,
+      userEmail: null,
+    };
   }
 
   sessions[sessionId].lastActive = now;
   return { sessionId, session: sessions[sessionId] };
 }
 
-// Helper: get next 3 available slots from Calendly
-async function getCalendlySlots() {
-  const res = await fetch("https://api.calendly.com/scheduled_events", {
-    headers: {
-      Authorization: `Bearer ${CALENDLY_TOKEN}`,
-      "Content-Type": "application/json",
-    },
-  });
-  const data = await res.json();
-  // This is a simplified version: pick next 3 upcoming times
-  const now = new Date();
-  const slots = data.collection
-    .filter(e => new Date(e.start_time) > now)
-    .slice(0, 3)
-    .map(e => ({
-      start: e.start_time,
-      end: e.end_time,
-    }));
-  return slots;
-}
-
 // POST /chat endpoint
 app.post("/chat", async (req, res) => {
-  const { message, sessionId, userName, userEmail, marketingConsent } = req.body;
+  const { message, sessionId, userName, userEmail } = req.body;
   const { sessionId: activeSessionId, session } = getSession(sessionId);
 
-  // Increment message count
+  // Save user info if provided
+  if (userName && !session.userName) session.userName = userName;
+  if (userEmail && !session.userEmail) session.userEmail = userEmail;
+
+  // Increment count
   session.count++;
 
-  // After 3 messages, suggest booking
-  let suggestBooking = false;
-  if (session.count === 3) suggestBooking = true;
+  // Add user message to history
+  session.history.push({ role: "user", content: message });
+  if (session.history.length > MESSAGE_LIMIT) {
+    session.history.shift(); // keep last N messages
+  }
 
   const systemMessage = `
-You are a friendly chatbot for MadeToAutomate. Only answer questions about MadeToAutomate services.
-Always use friendly, simple language.
-If user asks something unrelated, respond:
+You are a friendly chatbot for MadeToAutomate. 
+Always answer only about MadeToAutomate services.
+Use friendly, simple language. 
+If the user asks about something else, reply:
 "Sorry, I can only answer questions about MadeToAutomate services. Can I help you with something we do?"
-Greet the user by name if provided.
+Always remember their name (${session.userName || "unknown"}) and email (${session.userEmail || "unknown"}) if available.
 `;
 
   try {
-    let replyText = "";
-
-    if (suggestBooking) {
-      // Get 3 available slots
-      const slots = await getCalendlySlots();
-      if (slots.length > 0) {
-        replyText = "I see you’re interested! Here are 3 available times to book a free discovery call:";
-        res.json({ 
-          reply: replyText, 
-          sessionId: activeSessionId, 
-          bookingSlots: slots 
-        });
-        return;
-      }
-    }
-
-    // Regular OpenAI reply
     const completion = await openai.chat.completions.create({
       model: "gpt-3.5-turbo",
       messages: [
         { role: "system", content: systemMessage },
-        { role: "user", content: message },
+        ...session.history,
       ],
     });
 
-    replyText = completion.choices[0].message.content || 
-      "Sorry, I can only answer questions about MadeToAutomate services. Can I help you with something we do?";
+    const replyText =
+      completion.choices[0].message.content ||
+      "Sorry, I can only answer questions about MadeToAutomate services.";
 
-    res.json({ reply: replyText, sessionId: activeSessionId });
-  } catch (error) {
-    console.error("Error in chat:", error);
-    res.json({ reply: "Sorry, a little trouble now. Can we continue talking about MadeToAutomate services?", sessionId: activeSessionId });
+    // Save bot reply in history
+    session.history.push({ role: "assistant", content: replyText });
+
+    res.json({
+      reply: replyText,
+      sessionId: activeSessionId,
+    });
+  } catch (err) {
+    console.error("Error in chat:", err);
+    res.json({
+      reply: "Sorry, a little trouble now. Can we continue talking about MadeToAutomate services?",
+      sessionId: activeSessionId,
+    });
   }
 });
 
-// POST /book endpoint to create booking
+// POST /book → send email instead of Calendly
 app.post("/book", async (req, res) => {
-  const { startTime, userName, userEmail } = req.body;
+  const { startTime, sessionId } = req.body;
+  const { session } = getSession(sessionId);
+
+  const userName = session.userName || "Unknown";
+  const userEmail = session.userEmail || "Unknown";
 
   try {
-    const body = {
-      max_event_count: 1,
-      invitee: {
-        email: userEmail,
-        name: userName
-      },
-      event: EVENT_URL,
-      start_time: startTime,
-      timezone: TIMEZONE
-    };
+    await transporter.sendMail({
+      from: `"MadeToAutomate Bot" <${process.env.EMAIL_USER}>`,
+      to: "contact@madetoautomate.com",
+      subject: "New Appointment Request",
+      text: `
+A new appointment was requested:
 
-    const response = await fetch("https://api.calendly.com/scheduled_events", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${CALENDLY_TOKEN}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(body)
+Name: ${userName}
+Email: ${userEmail}
+Requested Time: ${startTime}
+    `,
     });
 
-    if (!response.ok) throw new Error("Failed to book on Calendly");
-
-    res.json({ success: true, message: "Your discovery call has been booked!" });
+    res.json({
+      success: true,
+      message:
+        "Thanks! Someone from our team will get back to you shortly to confirm your appointment.",
+    });
   } catch (err) {
-    console.error("Booking error:", err);
-    res.status(500).json({ success: false, message: "Failed to book appointment. Try again later." });
+    console.error("Email send error:", err);
+    res
+      .status(500)
+      .json({ success: false, message: "Failed to send booking request." });
   }
 });
 
