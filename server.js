@@ -6,6 +6,7 @@ import OpenAI from "openai";
 import { v4 as uuidv4 } from "uuid";
 import nodemailer from "nodemailer";
 import fetch from "node-fetch";
+import { DateTime } from "luxon"; // for timezone formatting
 
 const app = express();
 app.use(cors());
@@ -17,16 +18,14 @@ const transporter = nodemailer.createTransport({
   host: process.env.MAIL_HOST,
   port: process.env.MAIL_PORT,
   secure: process.env.MAIL_PORT == 465,
-  auth: { user: process.env.MAIL_USER, pass: process.env.MAIL_PASS },
+  auth: { user: process.env.MAIL_USER, pass: process.env.MAIL_PASS }
 });
 
 const ADMIN_EMAIL = process.env.TO_EMAIL;
-const CALENDLY_TOKEN = process.env.CALENDLY_TOKEN;
-const CALENDLY_EVENT_TYPE = "https://calendly.com/madetoautomate/15-minut-meeting";
-
 const sessions = {};
 const SESSION_TIMEOUT_MS = 60 * 60 * 1000;
 
+// --- Session handling ---
 function getSession(sessionId) {
   const now = Date.now();
   if (!sessionId || !sessions[sessionId]) {
@@ -57,20 +56,20 @@ function getSession(sessionId) {
   return { sessionId, session: sessions[sessionId] };
 }
 
-// --- Fetch next 3 available Calendly slots ---
+// --- Fetch Calendly slots and format CET ---
 async function getCalendlySlots() {
-  try {
-    const now = new Date().toISOString();
-    const res = await fetch(`https://api.calendly.com/scheduled_events?count=3&sort=start_time:asc&min_start_time=${now}&user=https://api.calendly.com/users/me`, {
-      headers: { Authorization: `Bearer ${CALENDLY_TOKEN}` }
-    });
-    const data = await res.json();
-    if (!data.collection) return [];
-    return data.collection.map(ev => ({ start: new Date(ev.start_time).toLocaleString() }));
-  } catch (err) {
-    console.error("Calendly fetch error:", err);
-    return [];
-  }
+  const now = new Date().toISOString();
+  const res = await fetch(`https://api.calendly.com/scheduled_events?count=3&min_start_time=${now}`, {
+    headers: { Authorization: `Bearer ${process.env.CALENDLY_TOKEN}` }
+  });
+  const data = await res.json();
+  if (!data.collection) return [];
+  
+  // Convert each start_time to CET format: YYYY-MM-DD HH:MM
+  return data.collection.map(ev => {
+    const dtCET = DateTime.fromISO(ev.start_time, { zone: "utc" }).setZone("Europe/Paris");
+    return { start: dtCET.toFormat("yyyy-MM-dd HH:mm") };
+  });
 }
 
 // --- Chat endpoint ---
@@ -92,29 +91,30 @@ Greet user by name if available.
 `;
 
   try {
-    let replyText = "";
-    // Offer booking explicitly if conditions met and not offered before
-    if (!session.offeredBooking && session.messageCount >= 3 && session.userName && session.userEmail) {
-      const slots = await getCalendlySlots();
-      if (slots.length) {
-        session.offeredBooking = true;
-        replyText = `Would you like to book an appointment with our representative? Here are the available times:\n${slots.map(s => "- " + s.start).join("\n")}\nPlease select a time.`;
-        // Send reply immediately without AI intervention
-        return res.json({ reply: replyText, sessionId: activeSessionId });
-      }
-    }
-
-    // Regular AI response
     const completion = await openai.chat.completions.create({
       model: "gpt-3.5-turbo",
       messages: [{ role: "system", content: systemMessage }, ...session.messages],
     });
 
-    replyText = completion.choices[0].message.content || 
+    const replyText = completion.choices[0].message.content || 
       "Sorry, I can only answer questions about MadeToAutomate services. Can I help you with something we do?";
     session.messages.push({ role: "assistant", content: replyText });
 
-    res.json({ reply: replyText, sessionId: activeSessionId });
+    let bookingSlots = null;
+    // Offer booking after 3 messages, only once
+    if (session.messageCount >= 3 && session.userName && session.userEmail && !session.offeredBooking) {
+      bookingSlots = await getCalendlySlots();
+      if (bookingSlots.length > 0) {
+        session.offeredBooking = true;
+        return res.json({
+          reply: "Would you like to book an appointment with our representative? Here are the available slots:",
+          sessionId: activeSessionId,
+          bookingSlots
+        });
+      }
+    }
+
+    res.json({ reply: replyText, sessionId: activeSessionId, bookingSlots });
   } catch (error) {
     console.error("Chat error:", error);
     res.json({
@@ -138,7 +138,7 @@ New Discovery Call Booking Request:
 Name: ${userName}
 Email: ${userEmail}
 Marketing Consent: ${marketingConsent === true ? "Agreed" : "Declined"}
-Requested Time: ${startTime}
+Requested Time: ${startTime} CET
 `;
 
   try {
