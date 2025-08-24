@@ -1,6 +1,6 @@
 {
   "name": "chatbot-backend",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "main": "server.js",
   "type": "module",
   "scripts": {
@@ -12,6 +12,6 @@
     "body-parser": "^1.20.2",
     "openai": "^4.0.0",
     "uuid": "^9.0.0",
-    "node-fetch": "^3.3.1"
+    "nodemailer": "^6.9.8"
   }
 }
