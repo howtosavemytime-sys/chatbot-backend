@@ -1,67 +1,62 @@
 import express from "express";
 import bodyParser from "body-parser";
-import fetch from "node-fetch";
+import cors from "cors";
 import nodemailer from "nodemailer";
-import dotenv from "dotenv";
-
-dotenv.config();
 
 const app = express();
+const PORT = process.env.PORT || 10000;
+
+app.use(cors());
 app.use(bodyParser.json());
 
-// Setup mail transporter
+// Nodemailer transporter with SSL (port 465)
 const transporter = nodemailer.createTransport({
   host: "smtp.zenbox.pl",
-  port: 587,
-  secure: false,
+  port: 465,
+  secure: true, // SSL
   auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS,
+    user: "contact@madetoautomate.com",
+    pass: "XmJ@Z%w@F9Ux",
   },
 });
 
 // Test email route
 app.get("/test-email", async (req, res) => {
   try {
-    await transporter.sendMail({
-      from: `"MTA Bot" <${process.env.EMAIL_USER}>`,
-      to: process.env.EMAIL_USER,
-      subject: "Test Email from Chatbot",
-      text: "If you see this, SMTP works ✅",
+    let info = await transporter.sendMail({
+      from: '"Chatbot Test" <contact@madetoautomate.com>',
+      to: "contact@madetoautomate.com",
+      subject: "✅ Test Email from Chatbot Backend (SSL)",
+      text: "If you see this, SMTP over SSL works correctly!",
     });
-    res.send("✅ Test email sent. Check your inbox!");
+
+    console.log("Email sent: ", info.messageId);
+    res.send("✅ Test email sent");
   } catch (err) {
     console.error("Email error:", err);
-    res.status(500).send("❌ Failed to send email");
+    res.send("❌ Failed to send email: " + err.message);
   }
 });
 
-app.post("/book", async (req, res) => {
-  const { userName, userEmail, startTime, marketingConsent } = req.body;
+// Booking route
+app.post("/send-booking", async (req, res) => {
+  const { name, email, bookingDate, marketingConsent } = req.body;
 
   try {
     await transporter.sendMail({
-      from: `"MTA Bot" <${process.env.EMAIL_USER}>`,
-      to: process.env.EMAIL_USER,
+      from: '"Chatbot" <contact@madetoautomate.com>',
+      to: "contact@madetoautomate.com",
       subject: "📅 New Booking Request",
-      text: `New booking request:
-Name: ${userName}
-Email: ${userEmail}
-Marketing Consent: ${marketingConsent ? "Yes" : "No"}
-Date: ${startTime}`,
+      text: `New booking request:\n\nName: ${name}\nEmail: ${email}\nDate: ${bookingDate}\nMarketing consent: ${marketingConsent}`,
     });
 
-    res.json({
-      message: "Thanks! Someone from our team will confirm your appointment soon.",
-    });
+    res.json({ success: true, message: "Booking email sent" });
   } catch (err) {
     console.error("Booking email error:", err);
-    res.status(500).json({ message: "Failed to send booking email." });
+    res.status(500).json({ success: false, message: err.message });
   }
 });
 
-// Keep alive
-app.get("/", (req, res) => res.send("✅ Chatbot backend is running"));
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+});
