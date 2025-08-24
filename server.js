@@ -5,6 +5,7 @@ import bodyParser from "body-parser";
 import OpenAI from "openai";
 import { v4 as uuidv4 } from "uuid";
 import nodemailer from "nodemailer";
+import fetch from "node-fetch"; // Needed for Calendly API requests
 
 const app = express();
 app.use(cors());
@@ -23,6 +24,8 @@ const transporter = nodemailer.createTransport({
 });
 
 const ADMIN_EMAIL = process.env.TO_EMAIL;
+const CALENDLY_TOKEN = process.env.CALENDLY_TOKEN;
+const CALENDLY_EVENT_TYPE = "https://calendly.com/madetoautomate/15-minut-meeting"; // your event type URL
 
 const sessions = {};
 const SESSION_TIMEOUT_MS = 60 * 60 * 1000;
@@ -31,30 +34,46 @@ function getSession(sessionId) {
   const now = Date.now();
   if (!sessionId || !sessions[sessionId]) {
     const newId = uuidv4();
-    sessions[newId] = { 
-      messages: [], 
-      userName: null, 
-      userEmail: null, 
-      marketingConsent: null, 
-      lastActive: now, 
+    sessions[newId] = {
+      messages: [],
+      userName: null,
+      userEmail: null,
+      marketingConsent: null,
+      lastActive: now,
       messageCount: 0,
-      askedBooking: false 
+      offeredBooking: false
     };
     return { sessionId: newId, session: sessions[newId] };
   }
   if (now - sessions[sessionId].lastActive > SESSION_TIMEOUT_MS) {
-    sessions[sessionId] = { 
-      messages: [], 
-      userName: null, 
-      userEmail: null, 
-      marketingConsent: null, 
-      lastActive: now, 
+    sessions[sessionId] = {
+      messages: [],
+      userName: null,
+      userEmail: null,
+      marketingConsent: null,
+      lastActive: now,
       messageCount: 0,
-      askedBooking: false 
+      offeredBooking: false
     };
   }
   sessions[sessionId].lastActive = now;
   return { sessionId, session: sessions[sessionId] };
+}
+
+// Fetch next 3 available Calendly slots
+async function getCalendlySlots() {
+  try {
+    const now = new Date().toISOString();
+    const res = await fetch(`https://api.calendly.com/event_types/${encodeURIComponent(CALENDLY_EVENT_TYPE)}/scheduled_events?count=3&sort=start_time:asc&min_start_time=${now}`, {
+      headers: { Authorization: `Bearer ${CALENDLY_TOKEN}` }
+    });
+    const data = await res.json();
+    if (!data.collection) return [];
+    return data.collection.map(ev => ({ start: ev.start_time }));
+  } catch (err) {
+    console.error("Calendly fetch error:", err);
+    return [];
+  }
 }
 
 // --- Chat endpoint ---
@@ -81,30 +100,27 @@ Greet user by name if available.
       messages: [{ role: "system", content: systemMessage }, ...session.messages],
     });
 
-    let replyText = completion.choices[0].message.content || 
+    const replyText = completion.choices[0].message.content || 
       "Sorry, I can only answer questions about MadeToAutomate services. Can I help you with something we do?";
-    
     session.messages.push({ role: "assistant", content: replyText });
 
+    // Offer booking after 3 messages, only once
     let bookingSlots = null;
-
-    // Offer booking prompt after 3 user messages if not asked yet
-    if (session.messageCount >= 3 && session.userName && session.userEmail && !session.askedBooking) {
-      session.askedBooking = true;
-      replyText = "Would you like to book an appointment with our representative?\n\n" + replyText;
-
-      const now = new Date();
-      bookingSlots = [
-        { start: new Date(now.getTime() + 1*60*60*1000) },
-        { start: new Date(now.getTime() + 2*60*60*1000) },
-        { start: new Date(now.getTime() + 3*60*60*1000) },
-      ];
+    if (!session.offeredBooking && session.messageCount >= 3 && session.userName && session.userEmail) {
+      const slots = await getCalendlySlots();
+      if (slots.length) {
+        session.offeredBooking = true;
+        bookingSlots = slots;
+      }
     }
 
     res.json({ reply: replyText, sessionId: activeSessionId, bookingSlots });
   } catch (error) {
     console.error("Chat error:", error);
-    res.json({ reply: "Sorry, a little trouble now. Can we continue talking about MadeToAutomate services?", sessionId: activeSessionId });
+    res.json({
+      reply: "Sorry, a little trouble now. Can we continue talking about MadeToAutomate services?",
+      sessionId: activeSessionId
+    });
   }
 });
 
@@ -122,7 +138,7 @@ New Discovery Call Booking Request:
 Name: ${userName}
 Email: ${userEmail}
 Marketing Consent: ${marketingConsent === true ? "Agreed" : "Declined"}
-Requested Time: ${startTime}
+Requested Time: ${new Date(startTime).toLocaleString()}
 `;
 
   try {
