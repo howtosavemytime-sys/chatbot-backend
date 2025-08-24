@@ -14,7 +14,6 @@ app.use(bodyParser.json());
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// Nodemailer setup
 const transporter = nodemailer.createTransport({
   host: process.env.MAIL_HOST,
   port: process.env.MAIL_PORT,
@@ -26,8 +25,9 @@ const transporter = nodemailer.createTransport({
 });
 
 const ADMIN_EMAIL = process.env.TO_EMAIL;
+const CALENDLY_TOKEN = process.env.CALENDLY_TOKEN;
+const CALENDLY_EVENT_URL = process.env.CALENDLY_EVENT_URL;
 
-// Session storage
 const sessions = {};
 const SESSION_TIMEOUT_MS = 60 * 60 * 1000;
 
@@ -35,80 +35,26 @@ function getSession(sessionId) {
   const now = Date.now();
   if (!sessionId || !sessions[sessionId]) {
     const newId = uuidv4();
-    sessions[newId] = {
-      messages: [],
-      userName: null,
-      userEmail: null,
-      marketingConsent: null,
-      lastActive: now,
-      messageCount: 0,
-    };
+    sessions[newId] = { messages: [], userName: null, userEmail: null, marketingConsent: null, lastActive: now, messageCount: 0 };
     return { sessionId: newId, session: sessions[newId] };
   }
   if (now - sessions[sessionId].lastActive > SESSION_TIMEOUT_MS) {
-    sessions[sessionId] = {
-      messages: [],
-      userName: null,
-      userEmail: null,
-      marketingConsent: null,
-      lastActive: now,
-      messageCount: 0,
-    };
+    sessions[sessionId] = { messages: [], userName: null, userEmail: null, marketingConsent: null, lastActive: now, messageCount: 0 };
   }
   sessions[sessionId].lastActive = now;
   return { sessionId, session: sessions[sessionId] };
 }
 
-// --- Helper: Fetch Calendly slots ---
-async function fetchCalendlySlots() {
-  try {
-    const resp = await fetch(
-      "https://api.calendly.com/scheduling_links",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${process.env.CALENDLY_TOKEN}`,
-        },
-        body: JSON.stringify({
-          max_event_count: 3,
-          owner: "https://calendly.com/madetoautomate/15-minut-meeting",
-        }),
-      }
-    );
+// Fetch available slots from Calendly
+async function getCalendlyAvailability() {
+  const headers = { Authorization: `Bearer ${CALENDLY_TOKEN}` };
+  const eventUri = CALENDLY_EVENT_URL.split('calendly.com/')[1];
+  const res = await fetch(`https://api.calendly.com/scheduled_events?event_type=${eventUri}&status=active`, { headers });
+  const data = await res.json();
 
-    const data = await resp.json();
-    if (!data || !data.resource) return [];
-
-    // Format start times CET YYYY-MM-DD HH:mm
-    return data.resource.event_guests
-      ? [] // no slots returned
-      : data.resource.scheduling_url
-      ? [
-          {
-            start: DateTime.now()
-              .setZone("CET")
-              .plus({ hours: 1 })
-              .toFormat("yyyy-MM-dd HH:mm"),
-          },
-          {
-            start: DateTime.now()
-              .setZone("CET")
-              .plus({ hours: 2 })
-              .toFormat("yyyy-MM-dd HH:mm"),
-          },
-          {
-            start: DateTime.now()
-              .setZone("CET")
-              .plus({ hours: 3 })
-              .toFormat("yyyy-MM-dd HH:mm"),
-          },
-        ]
-      : [];
-  } catch (err) {
-    console.error("Calendly fetch error:", err);
-    return [];
-  }
+  // Placeholder logic: just return next 3 hours for demo if Calendly API structure differs
+  const now = DateTime.now().setZone("Europe/Paris");
+  return [1,2,3].map(h => now.plus({ hours: h }).toFormat("yyyy-MM-dd HH:mm"));
 }
 
 // --- Chat endpoint ---
@@ -118,8 +64,7 @@ app.post("/chat", async (req, res) => {
 
   if (userName) session.userName = userName;
   if (userEmail) session.userEmail = userEmail;
-  if (marketingConsent !== undefined)
-    session.marketingConsent = marketingConsent;
+  if (marketingConsent !== undefined) session.marketingConsent = marketingConsent;
 
   session.messages.push({ role: "user", content: message });
   session.messageCount++;
@@ -128,8 +73,6 @@ app.post("/chat", async (req, res) => {
 You are a friendly chatbot for MadeToAutomate.
 Answer only about MadeToAutomate services, workflows, and processes.
 Greet user by name if available.
-If user has interacted at least 3 times, ask: 
-"Would you like to book an appointment with our representative?" and provide available booking slots.
 `;
 
   try {
@@ -138,24 +81,21 @@ If user has interacted at least 3 times, ask:
       messages: [{ role: "system", content: systemMessage }, ...session.messages],
     });
 
-    const replyText =
-      completion.choices[0].message.content ||
+    const replyText = completion.choices[0].message.content ||
       "Sorry, I can only answer questions about MadeToAutomate services. Can I help you with something we do?";
     session.messages.push({ role: "assistant", content: replyText });
 
+    // Offer booking after 3 user messages
     let bookingSlots = null;
     if (session.messageCount >= 3 && session.userName && session.userEmail) {
-      bookingSlots = await fetchCalendlySlots();
+      const slots = await getCalendlyAvailability();
+      bookingSlots = slots.map(s => ({ start: s }));
     }
 
     res.json({ reply: replyText, sessionId: activeSessionId, bookingSlots });
   } catch (error) {
     console.error("Chat error:", error);
-    res.json({
-      reply:
-        "Sorry, a little trouble now. Can we continue talking about MadeToAutomate services?",
-      sessionId: activeSessionId,
-    });
+    res.json({ reply: "Sorry, a little trouble now. Can we continue talking about MadeToAutomate services?", sessionId: activeSessionId });
   }
 });
 
@@ -164,9 +104,7 @@ app.post("/book", async (req, res) => {
   const { startTime, userName, userEmail, marketingConsent } = req.body;
 
   if (!userName || !userEmail || !startTime) {
-    return res
-      .status(400)
-      .json({ success: false, message: "Missing booking info" });
+    return res.status(400).json({ success: false, message: "Missing booking info" });
   }
 
   const emailText = `
@@ -186,15 +124,10 @@ Requested Time: ${startTime} CET
       text: emailText,
     });
 
-    res.json({
-      success: true,
-      message: `Thanks ${userName}! Someone from our team will contact you shortly to confirm the appointment.`,
-    });
+    res.json({ success: true, message: `Thanks ${userName}! Someone from our team will contact you shortly to confirm the appointment.` });
   } catch (err) {
     console.error("Booking email error:", err);
-    res
-      .status(500)
-      .json({ success: false, message: "Failed to send booking info. Try again later." });
+    res.status(500).json({ success: false, message: "Failed to send booking info. Try again later." });
   }
 });
 
