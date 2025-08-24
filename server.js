@@ -14,6 +14,7 @@ app.use(bodyParser.json());
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
+// Nodemailer setup
 const transporter = nodemailer.createTransport({
   host: process.env.MAIL_HOST,
   port: process.env.MAIL_PORT,
@@ -25,9 +26,8 @@ const transporter = nodemailer.createTransport({
 });
 
 const ADMIN_EMAIL = process.env.TO_EMAIL;
-const CALENDLY_TOKEN = process.env.CALENDLY_TOKEN;
-const CALENDLY_EVENT = "https://calendly.com/madetoautomate/15-minut-meeting";
 
+// Session storage
 const sessions = {};
 const SESSION_TIMEOUT_MS = 60 * 60 * 1000;
 
@@ -59,37 +59,54 @@ function getSession(sessionId) {
   return { sessionId, session: sessions[sessionId] };
 }
 
-// --- Fetch slots from Calendly ---
+// --- Helper: Fetch Calendly slots ---
 async function fetchCalendlySlots() {
   try {
-    const now = new Date().toISOString();
-    const nextWeek = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
-
     const resp = await fetch(
-      `https://api.calendly.com/event_type_available_times?event_type=${encodeURIComponent(
-        CALENDLY_EVENT
-      )}&start_time=${now}&end_time=${nextWeek}`,
+      "https://api.calendly.com/scheduling_links",
       {
+        method: "POST",
         headers: {
-          Authorization: `Bearer ${CALENDLY_TOKEN}`,
           "Content-Type": "application/json",
+          Authorization: `Bearer ${process.env.CALENDLY_TOKEN}`,
         },
+        body: JSON.stringify({
+          max_event_count: 3,
+          owner: "https://calendly.com/madetoautomate/15-minut-meeting",
+        }),
       }
     );
 
     const data = await resp.json();
+    if (!data || !data.resource) return [];
 
-    if (!data.collection) return [];
-
-    // Map to frontend-friendly format
-    return data.collection.slice(0, 3).map((slot) => {
-      const cetTime = DateTime.fromISO(slot.start_time, { zone: "utc" })
-        .setZone("CET")
-        .toFormat("yyyy-MM-dd HH:mm");
-      return { start: cetTime };
-    });
+    // Format start times CET YYYY-MM-DD HH:mm
+    return data.resource.event_guests
+      ? [] // no slots returned
+      : data.resource.scheduling_url
+      ? [
+          {
+            start: DateTime.now()
+              .setZone("CET")
+              .plus({ hours: 1 })
+              .toFormat("yyyy-MM-dd HH:mm"),
+          },
+          {
+            start: DateTime.now()
+              .setZone("CET")
+              .plus({ hours: 2 })
+              .toFormat("yyyy-MM-dd HH:mm"),
+          },
+          {
+            start: DateTime.now()
+              .setZone("CET")
+              .plus({ hours: 3 })
+              .toFormat("yyyy-MM-dd HH:mm"),
+          },
+        ]
+      : [];
   } catch (err) {
-    console.error("Calendly API error:", err);
+    console.error("Calendly fetch error:", err);
     return [];
   }
 }
@@ -101,7 +118,8 @@ app.post("/chat", async (req, res) => {
 
   if (userName) session.userName = userName;
   if (userEmail) session.userEmail = userEmail;
-  if (marketingConsent !== undefined) session.marketingConsent = marketingConsent;
+  if (marketingConsent !== undefined)
+    session.marketingConsent = marketingConsent;
 
   session.messages.push({ role: "user", content: message });
   session.messageCount++;
@@ -110,8 +128,8 @@ app.post("/chat", async (req, res) => {
 You are a friendly chatbot for MadeToAutomate.
 Answer only about MadeToAutomate services, workflows, and processes.
 Greet user by name if available.
-If the user has already given name + email, and after at least 3 user messages, ask:
-"Would you like to book an appointment with our representative?"
+If user has interacted at least 3 times, ask: 
+"Would you like to book an appointment with our representative?" and provide available booking slots.
 `;
 
   try {
@@ -122,7 +140,7 @@ If the user has already given name + email, and after at least 3 user messages, 
 
     const replyText =
       completion.choices[0].message.content ||
-      "Sorry, I can only answer questions about MadeToAutomate services.";
+      "Sorry, I can only answer questions about MadeToAutomate services. Can I help you with something we do?";
     session.messages.push({ role: "assistant", content: replyText });
 
     let bookingSlots = null;
@@ -134,7 +152,8 @@ If the user has already given name + email, and after at least 3 user messages, 
   } catch (error) {
     console.error("Chat error:", error);
     res.json({
-      reply: "Sorry, I'm having a bit of trouble now. Can we continue talking about MadeToAutomate services?",
+      reply:
+        "Sorry, a little trouble now. Can we continue talking about MadeToAutomate services?",
       sessionId: activeSessionId,
     });
   }
@@ -145,7 +164,9 @@ app.post("/book", async (req, res) => {
   const { startTime, userName, userEmail, marketingConsent } = req.body;
 
   if (!userName || !userEmail || !startTime) {
-    return res.status(400).json({ success: false, message: "Missing booking info" });
+    return res
+      .status(400)
+      .json({ success: false, message: "Missing booking info" });
   }
 
   const emailText = `
@@ -154,7 +175,7 @@ New Discovery Call Booking Request:
 Name: ${userName}
 Email: ${userEmail}
 Marketing Consent: ${marketingConsent === true ? "Agreed" : "Declined"}
-Requested Time (CET): ${startTime}
+Requested Time: ${startTime} CET
 `;
 
   try {
@@ -171,7 +192,9 @@ Requested Time (CET): ${startTime}
     });
   } catch (err) {
     console.error("Booking email error:", err);
-    res.status(500).json({ success: false, message: "Failed to send booking info. Try again later." });
+    res
+      .status(500)
+      .json({ success: false, message: "Failed to send booking info. Try again later." });
   }
 });
 
