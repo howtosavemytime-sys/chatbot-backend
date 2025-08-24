@@ -18,12 +18,12 @@ const openai = new OpenAI({
 // --- Email config ---
 const transporter = nodemailer.createTransport({
   host: process.env.MAIL_HOST || "smtp.zenbox.pl",
-  port: process.env.MAIL_PORT || 587,
+  port: Number(process.env.MAIL_PORT) || 587,
   secure: false,
   auth: {
     user: process.env.MAIL_USER || "contact@madetoautomate.com",
-    pass: process.env.MAIL_PASS || "XmJ@Z%w@F9Ux"
-  }
+    pass: process.env.MAIL_PASS || "XmJ@Z%w@F9Ux",
+  },
 });
 
 const ADMIN_EMAIL = process.env.TO_EMAIL || "contact@madetoautomate.com";
@@ -46,6 +46,20 @@ function getSession(sessionId) {
   return { sessionId, session: sessions[sessionId] };
 }
 
+// --- Generate 3 upcoming booking slots ---
+function generateBookingSlots() {
+  const slots = [];
+  const now = new Date();
+  let hour = now.getHours() + 1;
+  for (let i = 0; i < 3; i++) {
+    const slot = new Date(now);
+    slot.setHours(hour + i);
+    slot.setMinutes(0, 0, 0);
+    slots.push({ start: slot.toISOString() });
+  }
+  return slots;
+}
+
 // --- POST /chat ---
 app.post("/chat", async (req, res) => {
   const { message, sessionId, userName, userEmail, marketingConsent } = req.body;
@@ -56,7 +70,7 @@ app.post("/chat", async (req, res) => {
   if (userEmail) session.userEmail = userEmail;
   if (marketingConsent !== undefined) session.marketingConsent = marketingConsent;
 
-  // Add user message to session memory
+  // Add user message to session
   session.messages.push({ role: "user", content: message });
 
   const systemMessage = `
@@ -70,17 +84,27 @@ Greet the user by name if provided.
       model: "gpt-3.5-turbo",
       messages: [
         { role: "system", content: systemMessage },
-        ...session.messages
-      ]
+        ...session.messages,
+      ],
     });
 
     const replyText = completion.choices[0].message.content || 
       "Sorry, I can only answer questions about MadeToAutomate services. Can I help you with something we do?";
 
-    // Add bot reply to session memory
     session.messages.push({ role: "assistant", content: replyText });
 
-    res.json({ reply: replyText, sessionId: activeSessionId });
+    // --- Decide whether to show booking slots (after 3 messages) ---
+    let bookingSlots = [];
+    const userMessages = session.messages.filter(m => m.role === "user");
+    if (userMessages.length >= 3) {
+      bookingSlots = generateBookingSlots();
+    }
+
+    res.json({ 
+      reply: replyText,
+      sessionId: activeSessionId,
+      bookingSlots 
+    });
   } catch (error) {
     console.error("Error in chat:", error);
     res.json({ reply: "Sorry, a little trouble now. Can we continue talking about MadeToAutomate services?", sessionId: activeSessionId });
@@ -89,7 +113,7 @@ Greet the user by name if provided.
 
 // --- POST /book ---
 app.post("/book", async (req, res) => {
-  const { startTime, userName, userEmail, marketingConsent, sessionId } = req.body;
+  const { startTime, userName, userEmail, marketingConsent } = req.body;
 
   if (!userName || !userEmail || !startTime) {
     return res.status(400).json({ success: false, message: "Missing booking info" });
@@ -99,44 +123,15 @@ app.post("/book", async (req, res) => {
     from: `"MadeToAutomate Bot" <${process.env.MAIL_USER}>`,
     to: ADMIN_EMAIL,
     subject: "New Discovery Call Booking",
-    text: `
-A user wants to book a discovery call.
-
-Name: ${userName}
-Email: ${userEmail}
-Requested Time: ${startTime}
-Marketing Consent: ${marketingConsent ? "Yes" : "No"}
-    `
+    text: `A user wants to book a discovery call.\n\nName: ${userName}\nEmail: ${userEmail}\nMarketing consent: ${marketingConsent ? "Agreed" : "Declined"}\nRequested Time: ${startTime}`,
   };
 
   try {
     await transporter.sendMail(mailOptions);
-    res.json({ 
-      success: true, 
-      message: `Thanks ${userName}! Someone from our team will contact you shortly to confirm the appointment.`,
-      sessionId
-    });
+    res.json({ success: true, message: `Thanks ${userName}! Someone from our team will contact you shortly to confirm the appointment.` });
   } catch (err) {
     console.error("Email sending error:", err);
     res.status(500).json({ success: false, message: "Failed to send booking info. Try again later." });
-  }
-});
-
-// --- Temporary test email endpoint ---
-app.get("/test-email", async (req, res) => {
-  const mailOptions = {
-    from: `"MadeToAutomate Bot" <${process.env.MAIL_USER}>`,
-    to: ADMIN_EMAIL,
-    subject: "Test Email from MadeToAutomate Bot",
-    text: "Hello! This is a test email to check your SMTP settings."
-  };
-
-  try {
-    await transporter.sendMail(mailOptions);
-    res.send("Test email sent successfully! Check your inbox.");
-  } catch (err) {
-    console.error("Test email error:", err);
-    res.status(500).send("Failed to send test email. See server logs.");
   }
 });
 
