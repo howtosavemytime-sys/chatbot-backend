@@ -5,7 +5,7 @@ import bodyParser from "body-parser";
 import OpenAI from "openai";
 import { v4 as uuidv4 } from "uuid";
 import nodemailer from "nodemailer";
-import fetch from "node-fetch"; // Required to call Calendly API
+import fetch from "node-fetch";
 
 const app = express();
 app.use(cors());
@@ -17,10 +17,7 @@ const transporter = nodemailer.createTransport({
   host: process.env.MAIL_HOST,
   port: process.env.MAIL_PORT,
   secure: process.env.MAIL_PORT == 465,
-  auth: {
-    user: process.env.MAIL_USER,
-    pass: process.env.MAIL_PASS,
-  },
+  auth: { user: process.env.MAIL_USER, pass: process.env.MAIL_PASS },
 });
 
 const ADMIN_EMAIL = process.env.TO_EMAIL;
@@ -69,7 +66,7 @@ async function getCalendlySlots() {
     });
     const data = await res.json();
     if (!data.collection) return [];
-    return data.collection.map(ev => ({ start: ev.start_time }));
+    return data.collection.map(ev => ({ start: new Date(ev.start_time).toLocaleString() }));
   } catch (err) {
     console.error("Calendly fetch error:", err);
     return [];
@@ -95,29 +92,29 @@ Greet user by name if available.
 `;
 
   try {
+    let replyText = "";
+    // Offer booking explicitly if conditions met and not offered before
+    if (!session.offeredBooking && session.messageCount >= 3 && session.userName && session.userEmail) {
+      const slots = await getCalendlySlots();
+      if (slots.length) {
+        session.offeredBooking = true;
+        replyText = `Would you like to book an appointment with our representative? Here are the available times:\n${slots.map(s => "- " + s.start).join("\n")}\nPlease select a time.`;
+        // Send reply immediately without AI intervention
+        return res.json({ reply: replyText, sessionId: activeSessionId });
+      }
+    }
+
+    // Regular AI response
     const completion = await openai.chat.completions.create({
       model: "gpt-3.5-turbo",
       messages: [{ role: "system", content: systemMessage }, ...session.messages],
     });
 
-    let replyText = completion.choices[0].message.content || 
+    replyText = completion.choices[0].message.content || 
       "Sorry, I can only answer questions about MadeToAutomate services. Can I help you with something we do?";
     session.messages.push({ role: "assistant", content: replyText });
 
-    // Offer booking after 3 user messages, only once
-    let bookingSlots = null;
-    if (!session.offeredBooking && session.messageCount >= 3 && session.userName && session.userEmail) {
-      const slots = await getCalendlySlots();
-      if (slots.length) {
-        session.offeredBooking = true;
-        bookingSlots = slots;
-
-        // Prepend explicit booking question
-        replyText = `Would you like to book an appointment with our representative? Here are the available times:\n`;
-      }
-    }
-
-    res.json({ reply: replyText, sessionId: activeSessionId, bookingSlots });
+    res.json({ reply: replyText, sessionId: activeSessionId });
   } catch (error) {
     console.error("Chat error:", error);
     res.json({
@@ -141,7 +138,7 @@ New Discovery Call Booking Request:
 Name: ${userName}
 Email: ${userEmail}
 Marketing Consent: ${marketingConsent === true ? "Agreed" : "Declined"}
-Requested Time: ${new Date(startTime).toLocaleString()}
+Requested Time: ${startTime}
 `;
 
   try {
