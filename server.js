@@ -5,7 +5,7 @@ import bodyParser from "body-parser";
 import OpenAI from "openai";
 import { v4 as uuidv4 } from "uuid";
 import nodemailer from "nodemailer";
-import fetch from "node-fetch"; // Needed for Calendly API requests
+import fetch from "node-fetch"; // Required to call Calendly API
 
 const app = express();
 app.use(cors());
@@ -60,11 +60,11 @@ function getSession(sessionId) {
   return { sessionId, session: sessions[sessionId] };
 }
 
-// Fetch next 3 available Calendly slots
+// --- Fetch next 3 available Calendly slots ---
 async function getCalendlySlots() {
   try {
     const now = new Date().toISOString();
-    const res = await fetch(`https://api.calendly.com/event_types/${encodeURIComponent(CALENDLY_EVENT_TYPE)}/scheduled_events?count=3&sort=start_time:asc&min_start_time=${now}`, {
+    const res = await fetch(`https://api.calendly.com/scheduled_events?count=3&sort=start_time:asc&min_start_time=${now}&user=https://api.calendly.com/users/me`, {
       headers: { Authorization: `Bearer ${CALENDLY_TOKEN}` }
     });
     const data = await res.json();
@@ -104,7 +104,7 @@ Greet user by name if available.
       "Sorry, I can only answer questions about MadeToAutomate services. Can I help you with something we do?";
     session.messages.push({ role: "assistant", content: replyText });
 
-    // Offer booking after 3 messages, only once
+    // Offer booking after 3 user messages, only once
     let bookingSlots = null;
     if (!session.offeredBooking && session.messageCount >= 3 && session.userName && session.userEmail) {
       const slots = await getCalendlySlots();
