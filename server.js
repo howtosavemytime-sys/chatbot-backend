@@ -5,7 +5,6 @@ import bodyParser from "body-parser";
 import OpenAI from "openai";
 import { v4 as uuidv4 } from "uuid";
 import nodemailer from "nodemailer";
-import fetch from "node-fetch";
 
 const app = express();
 app.use(cors());
@@ -16,7 +15,7 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const transporter = nodemailer.createTransport({
   host: process.env.MAIL_HOST,
   port: process.env.MAIL_PORT,
-  secure: false,
+  secure: process.env.MAIL_PORT == 465,
   auth: {
     user: process.env.MAIL_USER,
     pass: process.env.MAIL_PASS,
@@ -32,42 +31,30 @@ function getSession(sessionId) {
   const now = Date.now();
   if (!sessionId || !sessions[sessionId]) {
     const newId = uuidv4();
-    sessions[newId] = {
-      messages: [],
-      userName: null,
-      userEmail: null,
-      marketingConsent: null,
-      lastActive: now,
+    sessions[newId] = { 
+      messages: [], 
+      userName: null, 
+      userEmail: null, 
+      marketingConsent: null, 
+      lastActive: now, 
       messageCount: 0,
-      askedBooking: false,
+      askedBooking: false 
     };
     return { sessionId: newId, session: sessions[newId] };
   }
   if (now - sessions[sessionId].lastActive > SESSION_TIMEOUT_MS) {
-    sessions[sessionId] = {
-      messages: [],
-      userName: null,
-      userEmail: null,
-      marketingConsent: null,
-      lastActive: now,
+    sessions[sessionId] = { 
+      messages: [], 
+      userName: null, 
+      userEmail: null, 
+      marketingConsent: null, 
+      lastActive: now, 
       messageCount: 0,
-      askedBooking: false,
+      askedBooking: false 
     };
   }
   sessions[sessionId].lastActive = now;
   return { sessionId, session: sessions[sessionId] };
-}
-
-// --- Get Calendly available slots ---
-async function getCalendlySlots() {
-  const url = `https://api.calendly.com/users/${process.env.CALENDLY_USER_URI}/scheduled_events`;
-  const res = await fetch(url, {
-    headers: { Authorization: `Bearer ${process.env.CALENDLY_API_KEY}` },
-  });
-  const data = await res.json();
-  // Pick first 3 available events
-  const slots = data.collection.slice(0, 3).map((e) => ({ start: new Date(e.start_time) }));
-  return slots;
 }
 
 // --- Chat endpoint ---
@@ -94,49 +81,39 @@ Greet user by name if available.
       messages: [{ role: "system", content: systemMessage }, ...session.messages],
     });
 
-    const replyText =
-      completion.choices[0].message.content ||
+    let replyText = completion.choices[0].message.content || 
       "Sorry, I can only answer questions about MadeToAutomate services. Can I help you with something we do?";
+    
     session.messages.push({ role: "assistant", content: replyText });
 
-    // Offer booking prompt after 3 messages
     let bookingSlots = null;
-    if (
-      session.messageCount >= 3 &&
-      session.userName &&
-      session.userEmail &&
-      !session.askedBooking
-    ) {
+
+    // Offer booking prompt after 3 user messages if not asked yet
+    if (session.messageCount >= 3 && session.userName && session.userEmail && !session.askedBooking) {
       session.askedBooking = true;
-      bookingSlots = await getCalendlySlots();
-      // return prompt + slots
-      res.json({
-        reply:
-          "Would you like to book an appointment with our representative? Here are the next available slots if you do:",
-        sessionId: activeSessionId,
-        bookingSlots,
-      });
-      return;
+      replyText = "Would you like to book an appointment with our representative?\n\n" + replyText;
+
+      const now = new Date();
+      bookingSlots = [
+        { start: new Date(now.getTime() + 1*60*60*1000) },
+        { start: new Date(now.getTime() + 2*60*60*1000) },
+        { start: new Date(now.getTime() + 3*60*60*1000) },
+      ];
     }
 
-    res.json({ reply: replyText, sessionId: activeSessionId });
+    res.json({ reply: replyText, sessionId: activeSessionId, bookingSlots });
   } catch (error) {
     console.error("Chat error:", error);
-    res.json({
-      reply:
-        "Sorry, a little trouble now. Can we continue talking about MadeToAutomate services?",
-      sessionId: activeSessionId,
-    });
+    res.json({ reply: "Sorry, a little trouble now. Can we continue talking about MadeToAutomate services?", sessionId: activeSessionId });
   }
 });
 
 // --- Booking endpoint ---
 app.post("/book", async (req, res) => {
   const { startTime, userName, userEmail, marketingConsent } = req.body;
+
   if (!userName || !userEmail || !startTime) {
-    return res
-      .status(400)
-      .json({ success: false, message: "Missing booking info" });
+    return res.status(400).json({ success: false, message: "Missing booking info" });
   }
 
   const emailText = `
@@ -144,10 +121,8 @@ New Discovery Call Booking Request:
 
 Name: ${userName}
 Email: ${userEmail}
-Marketing Consent: ${
-    marketingConsent === true ? "Agreed" : "Declined"
-  }
-Requested Time: ${new Date(startTime).toLocaleString()}
+Marketing Consent: ${marketingConsent === true ? "Agreed" : "Declined"}
+Requested Time: ${startTime}
 `;
 
   try {
@@ -157,15 +132,11 @@ Requested Time: ${new Date(startTime).toLocaleString()}
       subject: "New Discovery Call Booking",
       text: emailText,
     });
-    res.json({
-      success: true,
-      message: `Thanks ${userName}! Someone from our team will contact you shortly to confirm the appointment.`,
-    });
+
+    res.json({ success: true, message: `Thanks ${userName}! Someone from our team will contact you shortly to confirm the appointment.` });
   } catch (err) {
     console.error("Booking email error:", err);
-    res
-      .status(500)
-      .json({ success: false, message: "Failed to send booking info. Try again later." });
+    res.status(500).json({ success: false, message: "Failed to send booking info. Try again later." });
   }
 });
 
