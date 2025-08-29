@@ -12,10 +12,10 @@ const app = express();
 app.use(cors());
 app.use(bodyParser.json());
 
-/* ========= ENV (email & optional global defaults) ========= */
+/* ========= ENV ========= */
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-// Email
+// Email transport
 const transporter = nodemailer.createTransport({
   host: process.env.MAIL_HOST,
   port: process.env.MAIL_PORT,
@@ -28,7 +28,7 @@ const ADMIN_EMAIL = process.env.TO_EMAIL;
 const GLOBAL_CALENDLY_TOKEN = process.env.CALENDLY_TOKEN || "";
 const GLOBAL_CALENDLY_EVENT_TYPE_URI = process.env.CALENDLY_EVENT_TYPE_URI || "";
 
-// Optional license enforcement
+// License handling
 const ENFORCE_LICENSE = process.env.LICENSE_ENFORCE === "true";
 const LICENSE_KEYS = (process.env.LICENSE_KEYS || "")
   .split(",")
@@ -348,5 +348,69 @@ Requested Time: ${startTime}
   }
 });
 
+/* ========= Calendly discovery endpoints ========= */
+app.post("/calendly/event-types", async (req, res) => {
+  try {
+    const { calendlyToken, calendlySchedulingLink } = req.body || {};
+    const token = calendlyToken || process.env.CALENDLY_TOKEN || "";
+    if (!token) return res.status(400).json({ error: "Missing calendlyToken" });
+
+    const userUri = await calendlyGetUserUri(token);
+    if (!userUri) return res.status(401).json({ error: "Invalid Calendly token" });
+
+    const types = await calendlyListEventTypesByUser(token, userUri);
+    const simplified = types.map(t => ({
+      name: t.name,
+      slug: t.slug,
+      duration: t.duration,
+      uri: t.uri,
+      scheduling_url: t.scheduling_url,
+    }));
+
+    let desiredSlug = null;
+    if (calendlySchedulingLink) {
+      try {
+        const u = new URL(calendlySchedulingLink);
+        const parts = u.pathname.split("/").filter(Boolean);
+        if (parts.length >= 2) desiredSlug = parts[1].toLowerCase();
+      } catch {}
+    }
+
+    res.json({
+      ok: true,
+      count: simplified.length,
+      items: simplified,
+      suggested_uri:
+        desiredSlug
+          ? (simplified.find(x => (x.slug || "").toLowerCase() === desiredSlug)?.uri || null)
+          : (simplified.find(x => String(x.duration) === "30")?.uri || simplified[0]?.uri || null),
+    });
+  } catch (e) {
+    console.error("Calendly event-types error:", e);
+    res.status(500).json({ error: "Failed to list Calendly event types" });
+  }
+});
+
+app.post("/calendly/resolve", async (req, res) => {
+  try {
+    const { calendlyToken, calendlyEventTypeUri, calendlySchedulingLink } = req.body || {};
+    const token = calendlyToken || process.env.CALENDLY_TOKEN || "";
+    if (!token) return res.status(400).json({ error: "Missing calendlyToken" });
+
+    const uri = await resolveCalendlyEventTypeUri({
+      token,
+      providedEventTypeUri: calendlyEventTypeUri,
+      schedulingLink: calendlySchedulingLink,
+    });
+
+    if (!uri) return res.status(404).json({ ok: false, uri: null });
+    res.json({ ok: true, uri });
+  } catch (e) {
+    console.error("Calendly resolve error:", e);
+    res.status(500).json({ ok: false, uri: null });
+  }
+});
+
+/* ========= Start ========= */
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
