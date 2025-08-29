@@ -6,33 +6,45 @@ import OpenAI from "openai";
 import { v4 as uuidv4 } from "uuid";
 import nodemailer from "nodemailer";
 import { DateTime } from "luxon";
+import fetch from "node-fetch"; // keep in package.json
 
 const app = express();
-app.use(cors()); // adjust origins later if you want to restrict
+app.use(cors());
 app.use(bodyParser.json());
 
-// ---- OpenAI ----
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-const DEFAULT_MODEL = process.env.OPENAI_MODEL || "gpt-3.5-turbo";
+/* ========= ENV (email & optional global defaults) ========= */
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-// ---- Email (booking notifications) ----
+// Email (unchanged)
 const transporter = nodemailer.createTransport({
   host: process.env.MAIL_HOST,
   port: process.env.MAIL_PORT,
-  secure: String(process.env.MAIL_PORT) === "465",
-  auth: {
-    user: process.env.MAIL_USER,
-    pass: process.env.MAIL_PASS,
-  },
+  secure: process.env.MAIL_PORT == 465,
+  auth: { user: process.env.MAIL_USER, pass: process.env.MAIL_PASS },
 });
 const ADMIN_EMAIL = process.env.TO_EMAIL;
 
-// ---- Health ----
-app.get("/health", (req, res) => {
-  res.json({ ok: true, uptime: process.uptime() });
-});
+// OPTIONAL: Global Calendly defaults (used only if request doesn’t include creds)
+const GLOBAL_CALENDLY_TOKEN = process.env.CALENDLY_TOKEN || "";
+const GLOBAL_CALENDLY_EVENT_TYPE_URI = process.env.CALENDLY_EVENT_TYPE_URI || "";
 
-// ---- In-memory session store ----
+// OPTIONAL: simple license enforcement (toggle + comma-separated keys)
+const ENFORCE_LICENSE = process.env.LICENSE_ENFORCE === "true";
+const LICENSE_KEYS = (process.env.LICENSE_KEYS || "")
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean);
+
+function isLicensed(licenseKey) {
+  if (!ENFORCE_LICENSE) return true;
+  if (!licenseKey) return false;
+  return LICENSE_KEYS.includes(licenseKey);
+}
+
+/* ========= OpenAI ========= */
+const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+
+/* ========= Sessions (in-memory) ========= */
 const sessions = {};
 const SESSION_TIMEOUT_MS = 60 * 60 * 1000; // 1 hour
 
@@ -49,18 +61,10 @@ function getSession(sessionId) {
       lastActive: now,
       messageCount: 0,
       askedBooking: false,
-
-      // config sent from plugin (persist per session)
-      companyName: null,
-      tone: "friendly",
-      language: "en",
-      fallback: "Sorry, I don't have the answer to that right now.",
-      faqs: [], // [{q, a}]
     };
     return { sessionId: newId, session: sessions[newId] };
   }
   if (now - sessions[sessionId].lastActive > SESSION_TIMEOUT_MS) {
-    // reset expired session but keep same id for simplicity
     sessions[sessionId] = {
       messages: [],
       userName: null,
@@ -70,70 +74,79 @@ function getSession(sessionId) {
       lastActive: now,
       messageCount: 0,
       askedBooking: false,
-      companyName: null,
-      tone: "friendly",
-      language: "en",
-      fallback: "Sorry, I don't have the answer to that right now.",
-      faqs: [],
     };
   }
   sessions[sessionId].lastActive = now;
   return { sessionId, session: sessions[sessionId] };
 }
 
-function generateBookingSlots() {
+/* ========= Slot helpers ========= */
+
+// Fallback random slots (Mon–Fri, 10:00–16:00 CET/Paris)
+function generateFallbackSlots(count = 3) {
   const slots = [];
   let dt = DateTime.now().setZone("Europe/Paris").plus({ days: 1 }).startOf("day");
-  while (slots.length < 3) {
-    if (dt.weekday <= 5) { // Mon-Fri
+  while (slots.length < count) {
+    if (dt.weekday <= 5) {
       const hour = 10 + Math.floor(Math.random() * 7); // 10..16
       const minute = Math.random() < 0.5 ? 0 : 30;
       const slot = dt.set({ hour, minute });
-      slots.push(slot.toFormat("yyyy-MM-dd HH:mm"));
+      slots.push(slot.toISO({ suppressMilliseconds: true }));
     }
     dt = dt.plus({ days: 1 });
   }
   return slots;
 }
 
-// ---- (Optional) Licensing hook ----
-// Return false to block usage. Wire this up to your subscription system later.
-function isLicensed(licenseKey, originHost) {
-  // TODO: check licenseKey against your DB / Stripe webhook etc.
-  // You can also gate by originHost (domain).
-  return true; // allow all for now
-}
+// Calendly: fetch available start times for next 7 days
+async function getCalendlyAvailableTimes(tokenOverride, eventTypeUriOverride) {
+  const token = tokenOverride || GLOBAL_CALENDLY_TOKEN;
+  const eventTypeUri = eventTypeUriOverride || GLOBAL_CALENDLY_EVENT_TYPE_URI;
+  if (!token || !eventTypeUri) return null;
 
-// ---- Build system prompt dynamically from plugin config ----
-function buildSystemPrompt({ companyName, tone, language, fallback, faqs }) {
-  const brand = companyName?.trim() || "the client";
-  const toneText = tone === "formal" ? "formal and professional" : "friendly and approachable";
-  const lang = language || "en";
+  try {
+    const start = DateTime.now().toUTC().startOf("day");
+    const end = start.plus({ days: 7 }); // Calendly requires <= 7 days
 
-  // Add FAQs as lightweight grounding context
-  let faqBlock = "";
-  if (Array.isArray(faqs) && faqs.length > 0) {
-    const top = faqs.slice(0, 25) // keep prompt light
-      .map((f, i) => `Q${i + 1}: ${f.q}\nA${i + 1}: ${f.a}`)
-      .join("\n\n");
-    faqBlock = `\n\nKnowledge (FAQs provided by the site owner):\n${top}\n\nIf a user asks something that matches these FAQs, answer directly using them.`;
+    const url = new URL("https://api.calendly.com/event_type_available_times");
+    url.searchParams.set("event_type", eventTypeUri);
+    url.searchParams.set("start_time", start.toISO());
+    url.searchParams.set("end_time", end.toISO());
+
+    const resp = await fetch(url.toString(), {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!resp.ok) {
+      const txt = await resp.text();
+      console.error("Calendly availability error:", resp.status, txt);
+      return null;
+    }
+    const data = await resp.json();
+    const col = Array.isArray(data?.collection) ? data.collection : [];
+    return col.map(i => i.start_time).slice(0, 12); // ISO strings
+  } catch (e) {
+    console.error("Calendly fetch failed:", e);
+    return null;
   }
-
-  // Critical guardrails: only talk about the client's business; if unknown, use fallback.
-  const guardrails = `
-You are the chatbot for ${brand}.
-- Tone: ${toneText}.
-- Language: ${lang} (reply in this language).
-- Only answer questions about ${brand}'s services, workflows, policies, processes, or other info provided by the site owner.
-- If the user asks for anything outside the scope or you don't know the answer, reply EXACTLY with the fallback text (no extra words): "${fallback}"
-- Greet the user by their name if it was provided.
-${faqBlock}
-`;
-
-  return guardrails;
 }
 
-// --------------- Chat endpoint (driven by plugin config) ---------------
+// Booksy: placeholder (returns null). Wire real API when you have access.
+async function getBooksyAvailableTimes({ apiKey, businessId, locationId, serviceId }) {
+  // TODO: Implement Booksy availability call here once you have official API docs/keys.
+  // Ideas:
+  // - GET /availability?business={businessId}&location={locationId}&service={serviceId}&from=...&to=...
+  // - Use bearer apiKey in Authorization header
+  // Return array of ISO start times like Calendly function above.
+  console.warn("Booksy availability not implemented yet.");
+  return null;
+}
+
+/* ========= Health ========= */
+app.get("/health", (_, res) => {
+  res.json({ ok: true, uptime: process.uptime() });
+});
+
+/* ========= Chat ========= */
 app.post("/chat", async (req, res) => {
   const {
     message,
@@ -143,70 +156,91 @@ app.post("/chat", async (req, res) => {
     userPhone,
     marketingConsent,
 
-    // config coming from the plugin:
+    // From WP plugin (branding & knowledge)
     companyName,
-    tone,        // "friendly" | "formal"
-    language,    // "en" | "es" | "fr" | "de" | etc.
-    fallback,    // string fallback
-    faqs,        // [{q, a}]
-    licenseKey,  // optional - for future subscription control
+    botName,
+    tone = "friendly",
+    language = "en",
+    fallback = "Sorry, I don't have the answer to that right now. Please send us an email and one of our representatives will come back to you.",
+    aboutText = "",
+    allowedServices = [],
+    faqs = [],
+
+    // License
+    licenseKey,
+
+    // Booking provider + creds
+    bookingProvider = "none", // none | calendly | booksy
+    calendlyToken,
+    calendlyEventTypeUri,
+    booksyApiKey,
+    booksyBusinessId,
+    booksyLocationId,
+    booksyServiceId,
   } = req.body || {};
 
-  // License check (optional)
-  const originHost = (req.headers.origin || "").replace(/^https?:\/\//, "");
-  if (!isLicensed(licenseKey, originHost)) {
-    return res.status(402).json({
-      reply: "Your subscription is inactive. Please contact the site owner.",
-      sessionId: null,
-      bookingSlots: null,
-    });
+  // License gate
+  if (!isLicensed(licenseKey)) {
+    return res.status(402).json({ reply: fallback });
   }
 
-  // Session
   const { sessionId: activeSessionId, session } = getSession(sessionId);
 
-  // Persist user fields if provided
   if (userName) session.userName = userName;
   if (userEmail) session.userEmail = userEmail;
   if (userPhone) session.userPhone = userPhone;
   if (marketingConsent !== undefined) session.marketingConsent = marketingConsent;
 
-  // Persist config coming from plugin
-  if (companyName) session.companyName = companyName;
-  if (tone) session.tone = tone;
-  if (language) session.language = language;
-  if (fallback) session.fallback = fallback;
-  if (Array.isArray(faqs)) session.faqs = faqs;
+  // Build system prompt from WP settings
+  const servicesList = Array.isArray(allowedServices) ? allowedServices.filter(Boolean) : [];
+  const faqsList = Array.isArray(faqs)
+    ? faqs.filter(f => f && f.q && f.a).map(f => `Q: ${f.q}\nA: ${f.a}`).join("\n\n")
+    : "";
 
-  // Save user message
-  session.messages.push({ role: "user", content: message || "" });
-  session.messageCount++;
+  const style =
+    tone === "formal"
+      ? "Use a professional, concise tone."
+      : "Use a friendly, approachable tone.";
 
-  // Build system message from persisted session config
-  const systemMessage = buildSystemPrompt({
-    companyName: session.companyName,
-    tone: session.tone,
-    language: session.language,
-    fallback: session.fallback,
-    faqs: session.faqs,
-  });
+  const systemMessage = `
+You are the chatbot for "${companyName || "Your Company"}"${botName ? `, named ${botName}` : ""}.
+${style} Reply in language code: ${language}.
+
+BUSINESS PROFILE:
+${aboutText || "(no profile provided)"}
+
+FAQS (use exactly if relevant):
+${faqsList || "(none)"}
+
+${servicesList.length
+  ? `Only answer about these services: ${servicesList.join(", ")}. If asked outside this list, respond with: "${fallback}".`
+  : `Only answer about the company based on the profile and FAQs above. If asked outside scope, respond with: "${fallback}".`
+}
+
+Behavior:
+- Greet by name if available.
+- Be clear for non-technical users.
+- Keep answers brief unless asked for detail.
+- If unsure or out of scope, say the fallback line above.
+`.trim();
+
+  // Track conversation
+  if (message) {
+    session.messages.push({ role: "user", content: message });
+    session.messageCount++;
+  }
 
   try {
     const completion = await openai.chat.completions.create({
-      model: DEFAULT_MODEL,
-      messages: [
-        { role: "system", content: systemMessage },
-        ...session.messages,
-      ],
-      temperature: 0.3,
+      model: "gpt-3.5-turbo",
+      messages: [{ role: "system", content: systemMessage }, ...session.messages],
     });
 
     let replyText =
-      completion?.choices?.[0]?.message?.content?.trim() ||
-      session.fallback ||
-      "Sorry, I don't have the answer to that right now.";
+      completion.choices?.[0]?.message?.content?.trim() ||
+      fallback;
 
-    // Offer booking after 3 messages if we have name+email and we haven't asked yet
+    // Booking offer after 3 msg and having name+email
     let bookingSlots = null;
     if (
       session.messageCount >= 3 &&
@@ -215,32 +249,48 @@ app.post("/chat", async (req, res) => {
       !session.askedBooking
     ) {
       session.askedBooking = true;
-      replyText += `
 
-Would you like to book a 30-minute appointment with our representative?`;
-      bookingSlots = generateBookingSlots().map((s) => ({ start: s }));
+      // Try chosen provider → fallback if needed
+      let isoStarts = null;
+
+      if (bookingProvider === "calendly") {
+        isoStarts = await getCalendlyAvailableTimes(calendlyToken, calendlyEventTypeUri);
+      } else if (bookingProvider === "booksy") {
+        isoStarts = await getBooksyAvailableTimes({
+          apiKey: booksyApiKey,
+          businessId: booksyBusinessId,
+          locationId: booksyLocationId,
+          serviceId: booksyServiceId,
+        });
+      }
+
+      if (!isoStarts || !isoStarts.length) {
+        isoStarts = generateFallbackSlots(3);
+      }
+
+      replyText += `\n\nWould you like to book a 30-minute appointment with our representative?`;
+      bookingSlots = isoStarts.slice(0, 3).map(s => ({ start: s }));
     }
 
     session.messages.push({ role: "assistant", content: replyText });
+    return res.json({ reply: replyText, sessionId: activeSessionId, bookingSlots });
 
-    res.json({ reply: replyText, sessionId: activeSessionId, bookingSlots });
   } catch (error) {
     console.error("Chat error:", error);
-    res.json({
-      reply: session.fallback || "Sorry, something went wrong. Please try again.",
+    return res.json({
+      reply: fallback,
       sessionId: activeSessionId,
-      bookingSlots: null,
     });
   }
 });
 
-// --------------- Booking endpoint ---------------
+/* ========= Booking (email notification) ========= */
 app.post("/book", async (req, res) => {
   const { startTime, userName, userEmail, marketingConsent } = req.body || {};
 
   if (!userName || !userEmail || !startTime) {
     return res.status(400).json({ success: false, message: "Missing booking info" });
-  }
+    }
 
   const emailText = `
 New Discovery Call Booking Request:
@@ -248,12 +298,12 @@ New Discovery Call Booking Request:
 Name: ${userName}
 Email: ${userEmail}
 Marketing Consent: ${marketingConsent === true ? "Agreed" : "Declined"}
-Requested Time: ${startTime} CET
+Requested Time: ${startTime} (ISO/UTC)
 `;
 
   try {
     await transporter.sendMail({
-      from: `"Website Bot" <${process.env.MAIL_USER}>`,
+      from: `"MadeToAutomate Bot" <${process.env.MAIL_USER}>`,
       to: ADMIN_EMAIL,
       subject: "New Discovery Call Booking",
       text: emailText,
@@ -265,10 +315,9 @@ Requested Time: ${startTime} CET
     });
   } catch (err) {
     console.error("Booking email error:", err);
-    res.status(500).json({
-      success: false,
-      message: "Failed to send booking info. Try again later.",
-    });
+    res
+      .status(500)
+      .json({ success: false, message: "Failed to send booking info. Try again later." });
   }
 });
 
