@@ -224,6 +224,7 @@ app.post("/chat", async (req, res) => {
     booksyBusinessId,
     booksyLocationId,
     booksyServiceId,
+    fileData, // NEW: File attachment data
   } = req.body || {};
 
   if (!isLicensed(licenseKey)) {
@@ -245,6 +246,26 @@ app.post("/chat", async (req, res) => {
       ? "Use a professional, concise tone."
       : "Use a friendly, approachable tone.";
 
+  // NEW: Handle file attachments
+  let fileContext = "";
+  let useVisionModel = false;
+  
+  if (fileData && fileData.url) {
+    const fileExt = fileData.name.split('.').pop().toLowerCase();
+    
+    if (['jpg', 'jpeg', 'png', 'gif', 'webp'].includes(fileExt)) {
+      // Image file - use vision model
+      useVisionModel = true;
+      fileContext = `The user has shared an image file: ${fileData.name}. Please analyze and describe what you see in this image.`;
+    } else if (['pdf', 'doc', 'docx', 'txt'].includes(fileExt)) {
+      // Document file
+      fileContext = `The user has shared a document: ${fileData.name}. While I cannot directly read the file content, I can help answer questions about documents, provide guidance on document analysis, or suggest how to work with this type of file.`;
+    } else {
+      // Other file types
+      fileContext = `The user has shared a file: ${fileData.name} (${fileData.type}). I can provide general information about this file type or suggest ways to work with it.`;
+    }
+  }
+
   const systemMessage = `
 You are the chatbot for "${companyName || "Your Company"}"${botName ? `, named ${botName}` : ""}.
 ${style} Reply in language code: ${language}.
@@ -254,6 +275,8 @@ ${aboutText || "(no profile provided)"}
 
 FAQS:
 ${faqsList || "(none)"}
+
+${fileContext}
 
 ${allowedServices.length
   ? `Only answer about these services: ${allowedServices.join(", ")}. If asked outside this list, respond with: "${fallback}".`
@@ -266,9 +289,35 @@ ${allowedServices.length
   }
 
   try {
+    let messages = [{ role: "system", content: systemMessage }, ...session.messages];
+    
+    // NEW: If image file, modify the last user message to include the image
+    if (useVisionModel && fileData && fileData.url) {
+      // Replace the last user message with vision-compatible format
+      const lastMessageIndex = messages.length - 1;
+      if (messages[lastMessageIndex].role === "user") {
+        messages[lastMessageIndex] = {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: message || "Please analyze this image."
+            },
+            {
+              type: "image_url",
+              image_url: {
+                url: fileData.url
+              }
+            }
+          ]
+        };
+      }
+    }
+
     const completion = await openai.chat.completions.create({
-      model: "gpt-3.5-turbo",
-      messages: [{ role: "system", content: systemMessage }, ...session.messages],
+      model: useVisionModel ? "gpt-4o" : "gpt-3.5-turbo", // Use GPT-4V for images
+      messages: messages,
+      max_tokens: useVisionModel ? 1000 : undefined, // Set max tokens for vision model
     });
 
     let replyText =
@@ -311,7 +360,16 @@ ${allowedServices.length
     res.json({ reply: replyText, sessionId: activeSessionId, bookingSlots });
   } catch (err) {
     console.error("Chat error:", err);
-    res.json({ reply: fallback, sessionId: activeSessionId });
+    
+    // NEW: Better error handling for vision model
+    if (err.message && err.message.includes('vision')) {
+      res.json({ 
+        reply: "I can see you've shared an image, but I'm having trouble analyzing it right now. Could you describe what you'd like me to help you with regarding this image?", 
+        sessionId: activeSessionId 
+      });
+    } else {
+      res.json({ reply: fallback, sessionId: activeSessionId });
+    }
   }
 });
 
